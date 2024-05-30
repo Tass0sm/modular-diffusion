@@ -14,19 +14,16 @@ from torch.optim import AdamW
 
 from .module.unet import UNet
 
-from .module.utils.misc import exists
-from .module.utils.misc import default
-from .module.utils.misc import enlarge_as
-from .module.utils.misc import groupwise
+from .module.utils.misc import exists, default, enlarge_as, groupwise
 
 from random import random
-from einops import reduce
+from einops import reduce, repeat
 
 from pytorch_lightning import LightningModule
 
 from tqdm.auto import tqdm
 
-from typing import Tuple, Callable, Dict, Optional
+from typing import Tuple, Callable, Dict, Optional, Union
 
 class Diffusion(LightningModule):
     '''
@@ -46,7 +43,7 @@ class Diffusion(LightningModule):
             conf = yaml.safe_load(f)
 
         # Store the configuration file
-        cls.conf = conf
+        # cls.conf = conf
 
         net_par = conf['MODEL']
         dif_par = conf['DIFFUSION']
@@ -57,14 +54,14 @@ class Diffusion(LightningModule):
         # Initialize the network
         net = UNet(**net_par)
 
-        return cls(net, **dif_par)
+        return cls(net, **dif_par, conf=conf)
     
     def __init__(
         self, 
         model : nn.Module,
-        img_size : int = 32,
+        sample_size : Tuple[int, ...] = (32,),
         loss_type : str = 'L2',
-        self_cond : bool = True,
+        self_cond : bool = False,
         ode_solver : str = 'ddim',
         time_delta : float = 0.,
         sample_steps : int = 35,
@@ -72,13 +69,11 @@ class Diffusion(LightningModule):
         norm_backward : Optional[Callable] = None,
         data_key : str = 'smap',
         ctrl_key : Optional[str] = None,
+        conf : dict = {}
     ) -> None:
         super().__init__()
 
         assert ode_solver in ('ddim', 'dpm++', 'heun', 'heun_sde')
-
-        if isinstance(img_size, int):
-            img_size = (img_size, img_size)
 
         self.model = model
 
@@ -88,7 +83,7 @@ class Diffusion(LightningModule):
         self.time_delta = time_delta
         self.sample_steps = sample_steps
 
-        self.img_size = img_size
+        self.sample_size = sample_size
         self.data_key = data_key
         self.ctrl_key = ctrl_key
 
@@ -101,6 +96,10 @@ class Diffusion(LightningModule):
         # embedding module based on the nature of the control itself 
         self.ctrl_emb : Optional[nn.Module] = None
         self.null_ctrl = lambda ctrl : torch.zeros_like(ctrl)
+
+        self.validation_step_outputs = []
+
+        self.conf = conf
 
         self.save_hyperparameters()
     
@@ -192,7 +191,8 @@ class Diffusion(LightningModule):
         # which depends on the implementation of the various c_<...> terms
         # so that the network can either predict the noise (eps) or the
         # input directly (better when noise is large!)
-        out : Tensor = self.model(x_sig, t_sig, x_c = x_c, ctrl = ctrl)
+        out : Tensor = self.model(x_sig, t_sig, # x_c = x_c,
+                                  context = ctrl)
         out : Tensor = self.c_skip(p_sig) * x_t + self.c_out(p_sig) * out
 
         if clamp: out = out.clamp(-1., 1.)
@@ -218,7 +218,7 @@ class Diffusion(LightningModule):
     @torch.no_grad()
     def forward(
         self,
-        num_imgs : int = 4,
+        num_samples : int = 4,
         num_steps : Optional[int] = None,
         ode_solver : Optional[str] = None,
         norm_undo : Optional[Callable] = None,
@@ -241,13 +241,13 @@ class Diffusion(LightningModule):
         schedule = self.get_schedule(timestep)
         scaling  = self.get_scaling (timestep)
 
-        # schedule = repeat(schedule, '... -> b ...', b = num_imgs)
-        # scaling  = repeat(scaling , '... -> b ...', b = num_imgs)
+        # schedule = repeat(schedule, '... -> b ...', b = num_samples)
+        # scaling  = repeat(scaling , '... -> b ...', b = num_samples)
 
         # Encode the condition using the sequence encoder
-        ctrl = self.ctrl_emb(ctrl)[:num_imgs] if exists(ctrl) else ctrl
+        ctrl = self.ctrl_emb(ctrl)[:num_samples] if exists(ctrl) else ctrl
 
-        shape = (num_imgs, self.model.channels, *self.img_size)
+        shape = (num_samples, *self.sample_size)
 
         x_0 = self.sampler(
             shape,
@@ -297,7 +297,8 @@ class Diffusion(LightningModule):
                 x_c = self.predict(x_t, sig, ctrl = ctrl)
                 x_c.detach_()
 
-        x_p = self.predict(x_t, sig, x_c = x_c, ctrl = ctrl)
+        x_p = self.predict(x_t, sig, # x_c = x_c,
+                           ctrl = ctrl)
 
         # Compute the reconstruction loss
         loss = self.criterion(x_p, x_0, reduction = 'none')
@@ -315,7 +316,7 @@ class Diffusion(LightningModule):
 
         loss = self.compute_loss(x_0, ctrl = ctrl)
 
-        self.log_dict({'train_loss' : loss}, logger = True, on_step = True, sync_dist = True)
+        self.log_dict({'train_loss' : loss}, logger = False, on_step = True, sync_dist = True)
 
         return loss
     
@@ -326,33 +327,34 @@ class Diffusion(LightningModule):
 
         loss = self.compute_loss(x_0, ctrl = ctrl)
 
-        self.log_dict({'val_loss' : loss}, logger = True, on_step = True, sync_dist = True)
+        self.log_dict({'val_loss' : loss}, logger = False, on_step = True, sync_dist = True)
 
+        self.validation_step_outputs.append((x_0, ctrl))
         return x_0, ctrl
 
     @torch.no_grad()
-    def validation_epoch_end(self, val_outs : Tuple[Tensor, ...]) -> None:
+    def on_validation_epoch_end(self) -> None:
         '''
             At the end of the validation cycle, we inspect how the denoising
             procedure is doing by sampling novel images from the learn distribution.
         '''
 
         # Collect the input shapes
-        (x_0, ctrl), *_ = val_outs
+        (x_0, ctrl) = self.validation_step_outputs[-1]
 
         # Produce 8 samples and log them
-        imgs = self(
-                num_imgs = 8,
-                ctrl = ctrl,
-                verbose = False,
-            )
-        
-        assert not torch.isnan(imgs).any(), 'NaNs detected in imgs!'
+        # imgs = self(
+        #         num_imgs = 8,
+        #         ctrl = ctrl,
+        #         verbose = False,
+        #     )
 
-        imgs = make_grid(imgs, nrow = 4)
+        # assert not torch.isnan(imgs).any(), 'NaNs detected in imgs!'
+
+        # imgs = make_grid(imgs, nrow = 4)
 
         # Log images using the default TensorBoard logger
-        self.logger.experiment.add_image(self.log_img_key, imgs, global_step = self.global_step)
+        # self.logger.experiment.add_image(self.log_img_key, imgs, global_step = self.global_step)
     
     def configure_optimizers(self) -> None:
         optim_conf = self.conf['OPTIMIZER']
